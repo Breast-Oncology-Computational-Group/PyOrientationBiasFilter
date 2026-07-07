@@ -1,0 +1,5 @@
+# Python packages required by the orientation-bias filter.
+#
+# scipy - provides the binomial cumulative probability used for the artifact
+#         p-value (scipy.stats.binom.cdf) in artifact_statistics_scorer.
+scipy>=1.7
