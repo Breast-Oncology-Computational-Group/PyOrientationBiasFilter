@@ -106,6 +106,12 @@ KEY_COLUMNS = [
 # it stays the final column, which downstream keys on).
 _EXTRA_SUFFIXES = ["F", "mode", "p_value", "cut"]
 
+# MAF I/O encoding. Annotation columns can carry non-UTF-8 bytes (e.g. accented
+# characters from external annotation sources), so we read AND write with latin-1:
+# it maps every byte 0x00-0xFF one-to-one, never raises on decode, and round-trips
+# the passthrough columns byte-for-byte (our appended columns are pure ASCII).
+_ENCODING = "latin-1"
+
 
 # ---------------------------------------------------------------------------
 # Small field helpers (a MAF here == leading '#' comment lines, one header line,
@@ -156,7 +162,7 @@ def _variant_key(row: List[str], idx: Dict[str, int]) -> str:
 def _read_header(path: str) -> Tuple[List[str], List[str]]:
     """Return ``(comment_lines, header_fields)`` - stops right after the header."""
     comments: List[str] = []
-    with open(path, newline="") as handle:
+    with open(path, encoding=_ENCODING, newline="") as handle:
         for line in handle:
             line = line.rstrip("\n")
             if line.startswith("#"):
@@ -169,7 +175,7 @@ def _read_header(path: str) -> Tuple[List[str], List[str]]:
 def _iter_data_rows(path: str):
     """Yield ``(raw_line_without_newline, fields)`` for each data row of the MAF."""
     header_seen = False
-    with open(path, newline="") as handle:
+    with open(path, encoding=_ENCODING, newline="") as handle:
         for line in handle:
             line = line.rstrip("\n")
             if line.startswith("#"):
@@ -428,8 +434,8 @@ def _run_pass2(
     n_data_rows = 0
     width_mismatches = 0
 
-    with open(unfiltered_maf, "w", newline="") as unfiltered_out, \
-            open(output_maf, "w", newline="") as filtered_out:
+    with open(unfiltered_maf, "w", encoding=_ENCODING, newline="") as unfiltered_out, \
+            open(output_maf, "w", encoding=_ENCODING, newline="") as filtered_out:
         for comment in out_comments:
             unfiltered_out.write(comment + "\n")
             filtered_out.write(comment + "\n")
