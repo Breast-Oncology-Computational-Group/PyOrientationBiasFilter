@@ -29,6 +29,89 @@ appended columns:
 
 `<stub>` is the artifact label (e.g. `oxog`, `ffpe`).
 
+## Algorithm
+
+The filter runs in two stages over a single tumor sample.
+
+### Stage 1 — score each variant (`orientation_bias_filterer` / `artifact_statistics_scorer`)
+For every SNV genotype:
+
+1. **Artifact mode.** A substitution is `ref→alt`. You pass one artifact mode (e.g.
+   `C>T` for FFPE, `G>T` for OxoG); the filter also considers its reverse
+   complement. A variant is *in mode* if its `ref→alt` matches, *in complement* if
+   it matches the reverse complement, otherwise it is not an artifact candidate.
+   → `i_<stub>_mode` = 1 for in-mode-or-complement.
+2. **FOB — fraction of orientation bias** (`i_<stub>_F`). Alt reads split by read-pair
+   orientation into F1R2 and F2R1; the artifact concentrates in one of them. For an
+   in-mode variant that orientation is F1R2, so
+   `FOB = ALT_F1R2 / (ALT_F1R2 + ALT_F2R1)`; for the complement it is F2R1,
+   `FOB = ALT_F2R1 / (…)`. (Both counts zero → NaN.)
+3. **Artifact p-value** (`i_<stub>_p_value`). Model the artifact-oriented alt-read
+   count as `Binomial(n, p = pBias = 0.96)` and take the cumulative probability
+   (`scipy.stats.binom.cdf`) at the artifact-orientation count `k`, where:
+   - `n = ALT_F1R2 + ALT_F2R1` — the alt reads that got a read-pair orientation, and
+   - `k = ALT_F1R2` for an in-mode variant (or `ALT_F2R1` for the complement) — i.e.
+     `k = FOB · n`.
+
+   A real artifact has almost all alt reads in the artifact orientation (`k ≈ n`) →
+   the count sits near the top of the distribution → **p ≈ 1**; a clean ~50/50
+   variant → **p ≈ 0**. So a *higher* p-value is *more* artifact-like.
+
+   > This matches the CGA MATLAB filter, verified against its `i_<stub>_p_value`
+   > column. Note `n` is the **orientation-classified** alt total (`ALT_F1R2 +
+   > ALT_F2R1`), **not** `t_alt_count` (`AD[1]`); the two often differ, and the
+   > original GATK port used `AD[1]` with `k = round(FOB × AD[1])`, which is why its
+   > p-values diverged from MATLAB (e.g. `cdf(10,11)` vs `cdf(12,13)`).
+
+### Stage 2 — decide how many to cut (FDR + preAdapterQ suppression)
+Across the sample's unfiltered non-ref genotypes:
+
+1. **N** = the sample's total passing SNV calls = the FDR denominator. The
+   artifact-mode variants are the candidates; every other variant contributes p = 0.
+2. **Benjamini-Hochberg count.** Sort all p-values descending and walk them, cutting
+   while `p[i] ≥ fdr · (i+1) / N`; stop at the first that falls below that line. The
+   index reached is the number to cut. (Because "artifact" = high p, the cut is on the
+   *high* tail — the reverse of a classic BH on small p-values.)
+3. **Split by mode.** Divide that count between the mode and its complement in
+   proportion to each one's candidate count (integer arithmetic).
+4. **preAdapterQ suppression.** Scale each per-mode count by a sigmoid of the
+   bam-level preAdapterQ: `f(Q) = 1 / (1 + exp(bias_qp2 · (Q − bias_qp1)))`. A high Q
+   (bam shows little global artifact) → factor ≈ 0 → cut nothing; a low Q → factor ≈ 1
+   → cut the full BH count. `bias_qp1` (inflection, default 30 here) and `bias_qp2`
+   (steepness, 1.5) shape the curve.
+5. **Cut.** For each mode, mark the top-`count` candidates by descending p-value as
+   artifacts → `i_<stub>_cut = 1`.
+
+### Parameters
+`pBias = 0.96` (binomial mode, fixed in the core), `--fdr-threshold` (artifact FDR,
+0.01), `--bias-qp1` / `--bias-qp2` (suppression sigmoid). preAdapterQ is taken from
+the MAF's `i_<stub>_Q` column (see below).
+
+### Worked example
+
+One tumor sample with **100** unfiltered non-ref SNVs, filtering FFPE (mode `C>T`),
+`i_ffpe_Q = 25`, `--fdr-threshold 0.01 --bias-qp1 30`. Three SNVs are `C>T` (the
+candidates); the other 97 are other substitutions (not in mode → p treated as 0).
+
+**Stage 1** (`C>T` is in-mode → artifact orientation is F1R2, so `FOB = F1R2/n`,
+`k = F1R2`, `n = ALT_F1R2 + ALT_F2R1`; p = `cdf(k, n, 0.96)`):
+
+| variant | ALT_F1R2 | ALT_F2R1 | n (=F1R2+F2R1) | `i_ffpe_F` | k | `i_ffpe_p_value` |
+|---|---|---|---|---|---|---|
+| v1 | 20 | 0 | 20 | 1.00 | 20 | 1.000 |
+| v2 | 18 | 2 | 20 | 0.90 | 18 | 0.190 |
+| v3 | 10 | 10 | 20 | 0.50 | 10 | 0.000 |
+
+**Stage 2.** Candidate p-values sorted descending = `[1.000, 0.190, 0.000]`, padded to
+N=100 with zeros.
+- BH: cut while `p[i] ≥ 0.01·(i+1)/100` → v1 (`1.000 ≥ 0.0001` ✓), v2 (`0.190 ≥ 0.0002`
+  ✓), v3 (`0.000 ≥ 0.0003` ✗, stop) ⇒ **2** to cut.
+- Suppression `f(25) = 1/(1+exp(1.5·(25−30))) ≈ 0.999` → `round(2 × 0.999) = 2`.
+
+Result: v1, v2 → `i_ffpe_cut = 1`; v3 → `0`. Note the suppression lever: on a clean bam
+(e.g. `Q = 40`, `f ≈ 0.003`) the count becomes `round(2 × 0.003) = 0` — nothing is cut
+even though v1 is a perfect-looking artifact.
+
 ## How to run
 
 ```bash

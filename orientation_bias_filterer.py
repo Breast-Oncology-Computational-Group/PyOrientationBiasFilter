@@ -125,14 +125,31 @@ class OrientationBiasFilterer:
 
                     # FOB = fraction of alt reads in the artifact orientation (accounting for complement).
                     if is_relevant_artifact or is_relevant_artifact_complement:
-                        total_alt_allele_count = genotype.get_ad()[1] if genotype.has_ad() else 0
+                        alt_f1r2 = OrientationBiasUtils.get_genotype_integer(genotype, GATKVCFConstants.OXOG_ALT_F1R2_KEY, 0)
+                        alt_f2r1 = OrientationBiasUtils.get_genotype_integer(genotype, GATKVCFConstants.OXOG_ALT_F2R1_KEY, 0)
+                        # p-value uses the ORIENTATION-classified alt reads as the binomial n
+                        # (n = ALT_F1R2 + ALT_F2R1) and the artifact-orientation count as k
+                        # (ALT_F1R2 for the mode, ALT_F2R1 for its complement) -- matching the
+                        # CGA MATLAB filter, verified against its i_<stub>_p_value column.
+                        # NOTE: the original GATK port used n = AD[1] (t_alt_count) and
+                        # k = round(FOB * AD[1]); that diverges from MATLAB whenever the total
+                        # alt count differs from ALT_F1R2 + ALT_F2R1 (e.g. cdf(12,13) vs cdf(10,11)).
+                        orientation_total = alt_f1r2 + alt_f2r1
+                        artifact_count = alt_f1r2 if is_relevant_artifact else alt_f2r1
                         fob = OrientationBiasFilterer._calculate_fob(genotype, is_relevant_artifact)
-                        genotype_builder.attribute(
-                            OrientationBiasFilterConstants.P_ARTIFACT_FIELD_NAME,
-                            ArtifactStatisticsScorer.calculate_artifact_p_value(
-                                total_alt_allele_count, _java_round(fob * total_alt_allele_count), OrientationBiasFilterer.BIAS_P
-                            ),
-                        )
+                        if orientation_total > 0:
+                            p_artifact = ArtifactStatisticsScorer.calculate_artifact_p_value(
+                                orientation_total, artifact_count, OrientationBiasFilterer.BIAS_P
+                            )
+                        else:
+                            # No orientation-classified alt reads (FOB is NaN): no artifact
+                            # evidence, so score a near-zero p (not cut) rather than the
+                            # degenerate cdf(0, 0, p) = 1 that would flag it as an artifact.
+                            total_alt_allele_count = genotype.get_ad()[1] if genotype.has_ad() else 0
+                            p_artifact = ArtifactStatisticsScorer.calculate_artifact_p_value(
+                                total_alt_allele_count, 0, OrientationBiasFilterer.BIAS_P
+                            )
+                        genotype_builder.attribute(OrientationBiasFilterConstants.P_ARTIFACT_FIELD_NAME, p_artifact)
                         genotype_builder.attribute(OrientationBiasFilterConstants.FOB, fob)
                     else:
                         genotype_builder.attribute(OrientationBiasFilterConstants.P_ARTIFACT_FIELD_NAME, VCFConstants.EMPTY_ALLELE)
