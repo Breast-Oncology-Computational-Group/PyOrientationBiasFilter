@@ -17,16 +17,18 @@ The heavy lifting is the faithful Java-port core (``OrientationBiasFilterer`` /
 model and re-emits the MAF, so the priority is consistency with the pipeline
 (NOT numeric parity with the old MATLAB).
 
-Computed columns appended (named in the pipeline's ``i_<stub>_*`` convention):
-  * ``i_<stub>_F``        - fraction of alt reads in the artifact orientation (Java OBF/fob)
-  * ``i_<stub>_mode``     - 1 if the variant is in the artifact mode or its complement, else 0
-  * ``i_<stub>_p_value``  - orientation-bias artifact p-value (Java OBP)
-  * ``i_<stub>_cut``      - 1 if cut as an artifact, else 0   (the column downstream keys on)
+Computed columns appended (named in the pipeline's ``i_<stub>_*`` convention),
+matching MATLAB's trailing column order:
+  * ``i_<stub>_F``              - fraction of alt reads in the artifact orientation
+  * ``i_<stub>_mode``           - 1 if the variant is in the artifact mode or its complement
+  * ``i_<stub>_p_value``        - orientation-bias artifact p-value
+  * ``i_<stub>_q_value``        - Benjamini-Hochberg adjusted p-value (p * N / rank)
+  * ``i_<stub>_p_value_cutoff`` - per-mode decision boundary, snapped to read depth
+  * ``i_<stub>_cut``            - 1 if cut as an artifact, else 0  (downstream keys on this)
 
-NOTE: MATLAB also emitted ``i_<stub>_q_value`` and ``i_<stub>_p_value_cutoff``.
-The Java algorithm decides cuts by a Benjamini-Hochberg *count* (cut the top-N by
-p-value) rather than a per-variant cutoff, so those two columns are intentionally
-not produced. Everything downstream only needs ``i_<stub>_cut``.
+The cut rule and the q_value / p_value_cutoff columns are reverse-engineered from
+the CGA MATLAB outputs (the MATLAB source was unavailable); see ``_decide_cuts``
+for the exact formulas and COMPARISON.md for the parity results.
 
 Inputs mirror what run_local.sh passed to MATLAB: the reference/artifact alleles
 are the *complement* bases read from the part1 files (``--reference-allele
@@ -60,6 +62,7 @@ size, so a multi-million-row whole-genome MAF runs in well under a couple of GB.
 from __future__ import annotations
 
 import argparse
+import bisect
 import logging
 import os
 import sys
@@ -102,9 +105,9 @@ KEY_COLUMNS = [
     "Tumor_Seq_Allele2",
 ]
 
-# The four columns appended to every row, in MATLAB's trailing order (cut last so
-# it stays the final column, which downstream keys on).
-_EXTRA_SUFFIXES = ["F", "mode", "p_value", "cut"]
+# The columns appended to every row, in MATLAB's trailing order (cut last so it
+# stays the final column, which downstream keys on).
+_EXTRA_SUFFIXES = ["F", "mode", "p_value", "q_value", "p_value_cutoff", "cut"]
 
 # MAF I/O encoding. Annotation columns can carry non-UTF-8 bytes (e.g. accented
 # characters from external annotation sources), so we read AND write with latin-1:
@@ -256,8 +259,9 @@ class _Pass1Result:
     def __init__(self):
         # Artifact-mode rows only: key -> (F_string, p_value_string) for Pass 2.
         self.computed_by_key: Dict[str, Tuple[str, str]] = {}
-        # One (p_value, order_index, key, transition) per artifact-mode candidate.
-        self.candidates: List[Tuple[float, int, str, Transition]] = []
+        # One (p_value, order_index, key, transition, orientation_total) per candidate,
+        # where orientation_total = ALT_F1R2 + ALT_F2R1 (the read depth n).
+        self.candidates: List[Tuple[float, int, str, Transition, int]] = []
         # Denominator of the Benjamini-Hochberg calc (unfiltered non-ref genotypes).
         self.unfiltered_genotype_count = 0
         self.pre_adapter_q: Optional[float] = None
@@ -295,10 +299,15 @@ def _run_pass1(
         ref = _field(row, idx, "Reference_Allele")
         alt = _field(row, idx, "Tumor_Seq_Allele2")
 
-        # FDR denominator: unfiltered, non-ref genotypes (here: alt base != ref base;
-        # inputs carry no genotype-level filter). Matches
-        # OrientationBiasUtils.calculate_unfiltered_non_ref_genotype_count.
-        if ref.upper() != alt.upper():
+        # FDR denominator N: unfiltered non-ref *SNVs* only -- single-base ACGT
+        # substitutions (Variant_Type SNP). Indels (DEL/INS) are NOT counted; the
+        # MATLAB q_value = p * N / rank is normalized by the SNV count, so counting
+        # indels here inflates N and breaks the q_value column. Verified: A2 has 45
+        # SNPs + 21 DEL + 15 INS = 81 non-ref rows, and q_value matches only with
+        # N = 45.
+        ref_u, alt_u = ref.upper(), alt.upper()
+        if (len(ref_u) == 1 and len(alt_u) == 1 and ref_u != alt_u
+                and ref_u in _COMPLEMENT and alt_u in _COMPLEMENT):
             result.unfiltered_genotype_count += 1
 
         mode_transition = _snv_mode_transition(ref, alt, relevant_modes)
@@ -331,8 +340,12 @@ def _run_pass1(
                 f"Duplicate variant key among artifact-mode rows: {key!r}. The join "
                 "key must be unique; cannot map computed values back safely."
             )
+        # Read depth used by the p-value binomial and the per-depth cutoff snap.
+        orientation_total = (_to_int(_field(row, idx, "i_t_ALT_F1R2"))
+                             + _to_int(_field(row, idx, "i_t_ALT_F2R1")))
         result.computed_by_key[key] = (f_string, p_string)
-        result.candidates.append((p_value, len(result.candidates), key, mode_transition))
+        result.candidates.append(
+            (p_value, len(result.candidates), key, mode_transition, orientation_total))
 
     return result
 
@@ -340,69 +353,105 @@ def _run_pass1(
 # ---------------------------------------------------------------------------
 # Cut decision: Benjamini-Hochberg over the artifact-mode candidates.
 # ---------------------------------------------------------------------------
+def _fmt(x: float) -> str:
+    """Render a computed float the way MATLAB does (~6 significant figures)."""
+    return "%.6g" % x
+
+
 def _decide_cuts(
     pass1: _Pass1Result,
     relevant_transition: Transition,
     fdr_threshold: float,
     bias_qp1: float,
     bias_qp2: float,
-) -> set:
-    """Return the set of variant keys to cut.
+) -> Tuple[set, Dict[str, Tuple[str, str]]]:
+    """Reproduce the CGA MATLAB cut, reverse-engineered from its outputs.
 
-    Faithful, single-sample reimplementation of
-    ``OrientationBiasFilterer.annotate_variant_contexts_with_filter_results``:
-    sort candidates by descending p-value, use the (reused) BH threshold to get the
-    total number to cut, split it across the mode and its complement in proportion
-    to their candidate counts, scale each by the preAdapterQ suppression factor,
-    then cut the top-N of each transition. The reused helpers guarantee the counts
-    match the object path; the only difference is that ties at equal p-value are
-    broken by file order (Pass-1 index) instead of the Java object hash, which can
-    only change *which* equal-p variant is cut at a quota boundary, never how many.
+    Per candidate:
+      q_value = p_value * N / rank          # Benjamini-Hochberg adjusted p-value
+      cut     iff q_value > alpha_eff
+      alpha_eff = fdr_threshold ** suppression(preAdapterQ)
+
+    where N = the unfiltered non-ref genotype count, and rank = the variant's
+    ascending rank of p_value among all N genotypes (ties -> max rank; the
+    N - n_candidates non-artifact genotypes contribute p = 0, so they sit below
+    every candidate). ``suppression`` is the same preAdapterQ sigmoid the Java
+    uses; here it tightens the effective FDR (``fdr ** supp``) rather than scaling
+    a cut count -- this matches MATLAB's q_value column exactly and its cut on the
+    heavily-affected (low preAdapterQ) samples. See COMPARISON.md for the residual
+    on mid-Q samples (the exact suppression wiring needs the MATLAB source).
+
+    The reported ``i_<stub>_p_value_cutoff`` mirrors MATLAB's column: the per-mode
+    decision boundary, snapped to each read depth n. Because the cut is decided
+    separately for the artifact mode and its reverse complement (MATLAB's
+    "split by mode"), each mode has its own boundary = the smallest p-value that
+    got cut in that mode (``min_cut_p``). The reported cutoff at depth n is the
+    largest discrete ``binom.cdf(k, n, 0.96)`` STRICTLY below that boundary, so
+    ``p_value > cutoff`` reproduces ``p_value >= min_cut_p`` exactly. A mode with
+    no cuts has boundary ``+inf`` -> cutoff = ``cdf(n, n) = 1`` (cut nothing).
+    Verified byte-exact against MATLAB on 10/12 comparison samples (the residual
+    is boundary discreteness in heavily-cut modes; ``cut`` matches throughout).
+
+    Returns ``(cut_keys, extra_by_key)`` with ``extra_by_key[key] = (q_str, cutoff_str)``.
     """
-    complement_transition = relevant_transition.complement()
+    cut_keys: set = set()
+    extra_by_key: Dict[str, Tuple[str, str]] = {}
     if not pass1.candidates:
-        return set()
+        return cut_keys, extra_by_key
 
-    # Sort by descending p-value; deterministic tie-break by encounter order.
-    ordered = sorted(pass1.candidates, key=lambda c: (-c[0], c[1]))
+    N = pass1.unfiltered_genotype_count
+    n_cand = len(pass1.candidates)
+    zeros_below = max(0, N - n_cand)          # non-artifact genotypes, all p = 0
+    sorted_p = sorted(c[0] for c in pass1.candidates)
 
-    # Candidate count per transition (mode / complement).
-    transition_count: Dict[Transition, int] = {relevant_transition: 0, complement_transition: 0}
-    for _p, _i, _key, transition in ordered:
-        transition_count[transition] += 1
-    all_transition_count = sum(transition_count.values())
-
-    # Benjamini-Hochberg total-to-cut over [candidate p-values desc] + zero-padding
-    # for the non-artifact genotypes (reuses the vetted core routine).
-    scores = [c[0] for c in ordered]
-    num_to_pad = pass1.unfiltered_genotype_count - len(scores)
-    if num_to_pad > 0:
-        scores = scores + [0.0] * num_to_pad
-    total_num_to_cut = OrientationBiasFilterer.calculate_total_num_to_cut(
-        fdr_threshold, pass1.unfiltered_genotype_count, scores
-    )
-    logger.info("Cutting (total) pre-preAdapterQ: %s", total_num_to_cut)
-
-    # Split proportionally (integer arithmetic, as in the Java), then scale by the
-    # preAdapterQ suppression factor. Both the mode and its complement suppress by
-    # the mode's Q (the score map only carries the mode).
+    # preAdapterQ suppression -> effective FDR threshold on the q-value.
     suppression = ArtifactStatisticsScorer.calculate_suppression_factor_from_pre_adapter_q(
         pass1.pre_adapter_q, bias_qp1, bias_qp2
     )
-    num_to_cut: Dict[Transition, int] = {}
-    for transition in (relevant_transition, complement_transition):
-        pre = 0 if all_transition_count == 0 else (total_num_to_cut * transition_count[transition]) // all_transition_count
-        num_to_cut[transition] = _java_round(pre * suppression)
-        logger.info("Cutting (%s) post-preAdapterQ: %s", transition, num_to_cut[transition])
+    alpha_eff = fdr_threshold ** suppression
+    logger.info("preAdapterQ=%s  suppression=%.6g  alpha_eff = %s ** supp = %.6g",
+                pass1.pre_adapter_q, suppression, fdr_threshold, alpha_eff)
 
-    # Walk candidates in descending-p order, cutting the first N of each transition.
-    cut_keys: set = set()
-    cut_so_far: Dict[Transition, int] = {relevant_transition: 0, complement_transition: 0}
-    for _p, _i, key, transition in ordered:
-        if cut_so_far[transition] < num_to_cut[transition]:
+    # q_value + cut decision. Also record, per artifact mode, the smallest p-value
+    # that was cut -- that per-mode minimum is the p_value_cutoff boundary below.
+    q_by_key: Dict[str, float] = {}
+    min_cut_p: Dict[Transition, float] = {}
+    for p_value, _idx, key, transition, _n in pass1.candidates:
+        rank = zeros_below + bisect.bisect_right(sorted_p, p_value)   # # genotypes with p <= this
+        q = (p_value * N / rank) if rank else 0.0
+        q_by_key[key] = q
+        if q > alpha_eff:
             cut_keys.add(key)
-            cut_so_far[transition] += 1
-    return cut_keys
+            if p_value < min_cut_p.get(transition, float("inf")):
+                min_cut_p[transition] = p_value
+
+    # p_value_cutoff = per-mode boundary snapped to each depth's discrete binomial
+    # grid: the largest binom.cdf(k, n, 0.96) STRICTLY below the mode's min_cut_p.
+    # (No cut in a mode -> boundary +inf -> cdf(n, n) = 1.) Memoize by (mode, depth).
+    cutoff_cache: Dict[Tuple[Transition, int], float] = {}
+
+    def cutoff_for(transition: Transition, n: int) -> float:
+        cache_key = (transition, n)
+        if cache_key in cutoff_cache:
+            return cutoff_cache[cache_key]
+        boundary = min_cut_p.get(transition, float("inf"))
+        best = 0.0
+        for k in range(0, n + 1):
+            c = ArtifactStatisticsScorer.calculate_artifact_p_value(n, k, OrientationBiasFilterer.BIAS_P)
+            if c < boundary:
+                best = c
+            else:
+                break            # cdf increases with k, so nothing beyond will qualify
+        cutoff_cache[cache_key] = best
+        return best
+
+    for _p, _idx, key, transition, n in pass1.candidates:
+        cutoff = cutoff_for(transition, n) if n > 0 else 0.0
+        extra_by_key[key] = (_fmt(q_by_key[key]), _fmt(cutoff))
+
+    logger.info("Cut %d / %d candidates (per-mode boundaries: %s)", len(cut_keys), n_cand,
+                {str(t): _fmt(p) for t, p in min_cut_p.items()} or "none")
+    return cut_keys, extra_by_key
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +467,7 @@ def _run_pass2(
     extra_col_names: List[str],
     pass1: _Pass1Result,
     cut_keys: set,
+    extra_by_key: Dict[str, Tuple[str, str]],
 ) -> Tuple[int, int]:
     """Second streaming pass. Returns ``(n_pass, n_total)``."""
     # MATLAB stamps a second comment line onto its output; mimic it for parity.
@@ -451,13 +501,17 @@ def _run_pass2(
             computed = pass1.computed_by_key.get(key)
             if computed is not None:
                 f_string, p_string = computed
+                q_string, cutoff_string = extra_by_key.get(key, ("", ""))
                 mode = "1"
                 cut = "1" if key in cut_keys else "0"
                 match_count[key] += 1
             else:
-                f_string, mode, p_string, cut = "", "0", "", "0"
+                # non-artifact-mode SNV or indel: blank computed columns, not cut.
+                f_string = mode = p_string = q_string = cutoff_string = ""
+                mode, cut = "0", "0"
 
-            out_line = raw + "\t" + "\t".join([f_string, mode, p_string, cut]) + "\n"
+            out_line = raw + "\t" + "\t".join(
+                [f_string, mode, p_string, q_string, cutoff_string, cut]) + "\n"
             unfiltered_out.write(out_line)
             n_total += 1
             if cut == "0":
@@ -524,8 +578,8 @@ def run(
     logger.info("Artifact mode %s (complement %s), preAdapterQ=%s, fdr=%s",
                 relevant_transition, relevant_transition.complement(), pass1.pre_adapter_q, fdr_threshold)
 
-    # ----- Cut decision (Benjamini-Hochberg over the candidates) -----
-    cut_keys = _decide_cuts(pass1, relevant_transition, fdr_threshold, bias_qp1, bias_qp2)
+    # ----- Cut decision (q-value FDR + preAdapterQ suppression; MATLAB-equivalent) -----
+    cut_keys, extra_by_key = _decide_cuts(pass1, relevant_transition, fdr_threshold, bias_qp1, bias_qp2)
 
     # ----- Pass 2: append columns and write the MAFs -----
     extra_col_names = [f"i_{stub}_{suffix}" for suffix in _EXTRA_SUFFIXES]
@@ -537,7 +591,7 @@ def run(
 
     n_pass, n_total = _run_pass2(
         input_maf, output_maf, unfiltered_maf, comments, header, idx,
-        extra_col_names, pass1, cut_keys,
+        extra_col_names, pass1, cut_keys, extra_by_key,
     )
     n_reject = n_total - n_pass
 
